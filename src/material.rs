@@ -21,6 +21,8 @@ pub enum Kind {
     Lantern,
     Roof,
     Flower,
+    /// Viga oscura de entramado.
+    Beam,
 }
 
 impl Kind {
@@ -30,9 +32,9 @@ impl Kind {
 
     pub fn from_id(id: u8) -> Kind {
         use Kind::*;
-        const TABLE: [Kind; 15] = [
+        const TABLE: [Kind; 16] = [
             Air, Grass, Dirt, Stone, Sand, Plank, Log, LeafGreen, LeafPink, LeafOrange, Water,
-            Glass, Lantern, Roof, Flower,
+            Glass, Lantern, Roof, Flower, Beam,
         ];
         TABLE[id as usize]
     }
@@ -69,7 +71,7 @@ const fn mat(
 }
 
 /// Tabla de materiales indexada por el id del bloque.
-pub const MATERIALS: [Material; 15] = [
+pub const MATERIALS: [Material; 16] = [
     // Air (nunca se sombrea)
     mat(Vec3::new(0.0, 0.0, 0.0), [0.0, 0.0], 1.0, 0.0, 0.0, 1.0),
     // Grass
@@ -93,19 +95,21 @@ pub const MATERIALS: [Material; 15] = [
     // Water: refracción + reflejo especular
     mat(Vec3::new(0.10, 0.34, 0.42), [0.25, 0.9], 220.0, 1.0, 0.92, 1.333),
     // Glass: ventana reflectante y transparente
-    mat(Vec3::new(0.82, 0.90, 0.92), [0.15, 0.8], 160.0, 0.55, 0.88, 1.52),
+    mat(Vec3::new(0.70, 0.84, 0.90), [0.15, 0.8], 160.0, 0.80, 0.72, 1.52),
     // Lantern (emisivo, se ajusta abajo)
     mat(Vec3::new(1.0, 0.85, 0.55), [0.6, 0.4], 60.0, 0.0, 0.25, 1.0),
     // Roof (teja de barro)
     mat(Vec3::new(0.64, 0.27, 0.22), [0.9, 0.15], 20.0, 0.04, 0.0, 1.0),
     // Flower
     mat(Vec3::new(0.88, 0.42, 0.52), [0.95, 0.10], 10.0, 0.0, 0.0, 1.0),
+    // Beam: madera oscura del entramado
+    mat(Vec3::new(0.26, 0.16, 0.11), [0.88, 0.14], 28.0, 0.03, 0.0, 1.0),
 ];
 
 pub fn material_of(id: u8) -> Material {
     let mut material = MATERIALS[id as usize];
     if Kind::from_id(id) == Kind::Lantern {
-        material.emissive = Vec3::new(1.0, 0.72, 0.36) * 1.5;
+        material.emissive = Vec3::new(1.0, 0.72, 0.36) * 3.0;
     }
     material
 }

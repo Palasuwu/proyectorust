@@ -1,33 +1,72 @@
 # Diorama Voxel — Raytracer en Rust
 
-Diorama de una laguna con una cabaña de madera, renderizado con un **raytracer escrito desde cero en Rust**, usando **únicamente la librería estándar** (sin crates externos). La escena está construida con cubos texturizados dentro de una rejilla de voxeles de 160×104×160 (≈2.7 millones de celdas) que se recorre con el algoritmo **DDA**.
+Diorama de una laguna con una cabaña de madera, renderizado con un **raytracer escrito desde cero en Rust**, usando **únicamente la librería estándar** (sin crates externos). La escena está construida con cubos texturizados dentro de una rejilla de voxeles de 176×112×176 (≈3.5 millones de celdas) que se recorre con el algoritmo **DDA**.
 
 ![Diorama](docs/diorama.png)
 
 ## Video
 
-`docs/diorama.mp4` — vuelta completa de la cámara con acercamiento y alejamiento, y el oleaje en movimiento.
+Vuelta completa de la cámara con acercamiento y alejamiento, y el oleaje en movimiento:
 
-https://github.com/Palasuwu/proyectorust/raw/main/docs/diorama.mp4
+![Animación](docs/diorama.gif)
+
+El video en calidad completa (960×720, 24 fps) está en [`docs/diorama.mp4`](docs/diorama.mp4).
+
+## Modo noche
+
+```bash
+cargo run --release -- --night --sun-elev 28 --sun-azim 140
+cargo run --release -- --night --window        # interactivo
+```
+
+![Noche](docs/noche.png)
+
+![Muelle de noche](docs/noche-muelle.png)
+
+De noche el sol se cambia por una luna tenue y azulada, el skybox se regenera con estrellas y halo lunar, y la escena pasa a iluminarse con los **faroles**: cada bloque emisivo de la escena se convierte en una luz puntual con su atenuación y su propia sombra.
+
+Que eso no cueste caro es por el mismo truco que la oclusión ambiental: como ni los faroles ni la geometría se mueven, **la luz que recibe cada cara de cubo es siempre la misma**, así que se calcula la primera vez que se ve esa cara y se reutiliza. Por eso una imagen de noche cuesta prácticamente lo mismo que una de día, aunque haya nueve luces con sombras.
 
 ## Galería
 
-| Laguna: refracción, reflejo y oleaje | Vista trasera: estratos de roca |
+| Laguna: refracción, reflejo y oleaje | Vista lateral |
 |---|---|
-| ![Laguna](docs/laguna.png) | ![Atrás](docs/atras.png) |
+| ![Laguna](docs/laguna.png) | ![Lateral](docs/lateral.png) |
+
+| Vista trasera: estratos de roca del zócalo |
+|---|
+| ![Atrás](docs/atras.png) |
+
+## Modo en vivo (interactivo)
+
+```bash
+cargo run --release -- --live
+```
+
+Abre la escena dentro de la terminal y la cámara se mueve con el teclado, redibujando en cada cuadro (~20-25 fps):
+
+| Tecla | Acción |
+|---|---|
+| Flechas o `W` `A` `S` `D` | Girar la cámara alrededor del diorama |
+| `+` / `-` (o `z` / `x`) | Acercar y alejar |
+| Espacio | Pausar o reanudar el oleaje |
+| `r` | Volver a la vista inicial |
+| `q` | Salir |
+
+No usa ninguna ventana ni librería gráfica: [`src/live.rs`](src/live.rs) pinta cada celda de la terminal con el carácter de medio bloque `▀` y color RGB de 24 bits, así cada celda muestra dos pixeles. El modo crudo del teclado se pide al programa `stty` del sistema.
 
 ## Cómo ejecutarlo
 
 ```bash
 cargo run --release                          # imagen única -> render.bmp
 cargo run --release -- --yaw 120 --distance 220 --samples 2 --out vista.bmp
-cargo run --release -- --frames 150 --out frames    # secuencia para el video
+cargo run --release -- --frames 144 --out frames    # secuencia para el video
 ```
 
 Para armar el video a partir de los frames (ffmpeg es una herramienta externa, no una librería del programa):
 
 ```bash
-ffmpeg -framerate 30 -i frames/frame_%04d.bmp -pix_fmt yuv420p -crf 20 docs/diorama.mp4
+ffmpeg -framerate 24 -i frames/frame_%04d.bmp -c:v libx264 -pix_fmt yuv420p -crf 20 docs/diorama.mp4
 ```
 
 ### Opciones
@@ -52,7 +91,7 @@ ffmpeg -framerate 30 -i frames/frame_%04d.bmp -pix_fmt yuv420p -crf 20 docs/dior
 
 ### Materiales (5 pts c/u, máximo 25)
 
-14 tipos de bloque, cada uno con **su propia textura procedural** y sus propios parámetros ([`src/material.rs`](src/material.rs), [`src/texture.rs`](src/texture.rs)):
+15 tipos de bloque, cada uno con **su propia textura procedural** y sus propios parámetros ([`src/material.rs`](src/material.rs), [`src/texture.rs`](src/texture.rs)):
 
 | Material | Albedo (dif/esp) | Specular | Reflectividad | Transparencia | Índice refracción |
 |---|---|---|---|---|---|
@@ -68,6 +107,7 @@ ffmpeg -framerate 30 -i frames/frame_%04d.bmp -pix_fmt yuv420p -crf 20 docs/dior
 | Farol (emisivo) | 0.60 / 0.40 | 60 | — | 0.25 | — |
 | Teja | 0.90 / 0.15 | 20 | 0.04 | — | — |
 | Flor | 0.95 / 0.10 | 10 | — | — | — |
+| Viga | 0.88 / 0.14 | 28 | 0.03 | — | — |
 
 Las texturas no son imágenes cargadas de disco: se generan con hash y ruido de valor, dividiendo cada cara del cubo en 16×16 texels. Por eso cada material tiene su propio patrón: vetas y juntas en los tablones, anillos en las tapas del tronco, tejas escalonadas en el techo, marco en el vidrio, grietas en la piedra.
 
@@ -85,9 +125,10 @@ También en `cast_ray()`: los rayos reflejados usan **Fresnel (aproximación de 
 
 ### Complejidad y atractivo visual (50 pts)
 
-- Terreno procedural con colina, acantilados, afloramientos de piedra y estratos en el zócalo
-- Laguna cortada en el borde del diorama, con fondo oscuro, juncos, nenúfares, bote y muelle
-- Cabaña con zócalo de ladrillo, muros de tablón, esquinas de tronco, ventanas, puerta, techo a dos aguas con alero, chimenea, terraza sobre pilotes con barandal y jardineras
+- Terreno procedural con cresta boscosa de fondo, acantilados, afloramientos de piedra y estratos en el zócalo
+- Lago cortado en el borde del diorama, con fondo oscuro, juncos, nenúfares, bote y muelle
+- Cabaña de 44×36 bloques con zócalo de ladrillo, muros de tablón, esquinas de tronco, ventanales, puerta, techo a dos aguas con alero, chimenea y ventana de ático
+- Terraza sobre pilotes que se proyecta sobre el agua, con barandal, mesa, sillas, macetas y faroles
 - Bosque de coníferas y árboles frondosos en tres colores, arbustos, hierba alta, flores, peñascos, camino de piedra, banca y letrero
 - **Oclusión ambiental** con 13 rayos por impacto, sombras duras del sol, iluminación Phong y tonemap filmico (ACES)
 
@@ -108,6 +149,18 @@ También en `cast_ray()`: los rayos reflejados usan **Fresnel (aproximación de 
 | [`src/vec3.rs`](src/vec3.rs) | Álgebra de vectores |
 
 El render usa todos los núcleos disponibles con `std::thread::scope`. Las pruebas del recorrido DDA se corren con `cargo test`.
+
+## Optimizaciones
+
+Una imagen de 900×700 con calidad completa pasó de **375 ms a 111 ms** (3.4× más rápido), lo que permite el modo interactivo:
+
+| Optimización | Qué resuelve | Ganancia |
+|---|---|---|
+| Rejilla gruesa de 8×8×8 ([`src/voxel.rs`](src/voxel.rs)) | Los rayos saltan de golpe los macro-bloques vacíos en vez de recorrer el aire celda por celda | 375 → 260 ms |
+| Reparto dinámico de filas ([`src/render.rs`](src/render.rs)) | Cada hilo toma la siguiente fila libre: las filas de cielo son mucho más baratas que las del bosque y con bloques fijos sobraban núcleos ociosos | 260 → 195 ms |
+| Caché de oclusión ambiental por cara de cubo | La geometría no cambia, así que la oclusión de una cara siempre da lo mismo: se calcula una vez y se reutiliza en todos los pixeles y cuadros (enteros atómicos, sin bloqueos) | 195 → 111 ms |
+
+El reparto de costos se midió apagando cada parte por separado: la oclusión ambiental se llevaba la mitad del tiempo, las sombras 22 ms y las texturas 7 ms.
 
 ## Créditos
 

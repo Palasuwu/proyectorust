@@ -6,6 +6,8 @@
 use crate::vec3::Vec3;
 
 const EPSILON: f32 = 1e-4;
+/// Lado (en voxeles) de cada macro-bloque de la rejilla gruesa.
+const COARSE: i32 = 8;
 
 pub struct VoxelHit {
     pub distance: f32,
@@ -20,6 +22,10 @@ pub struct Grid {
     /// Esquina mínima de la rejilla en coordenadas de mundo.
     pub origin: Vec3,
     cells: Vec<u8>,
+    /// Rejilla gruesa: marca qué macro-bloques de 8x8x8 tienen algo sólido, para
+    /// que los rayos puedan saltarse el aire vacío de un tirón.
+    coarse_size: [i32; 3],
+    coarse: Vec<bool>,
 }
 
 fn axis(v: Vec3, i: usize) -> f32 {
@@ -33,11 +39,62 @@ fn axis(v: Vec3, i: usize) -> f32 {
 impl Grid {
     pub fn new(size: [i32; 3], origin: Vec3) -> Self {
         let total = (size[0] * size[1] * size[2]) as usize;
-        Self { size, origin, cells: vec![0; total] }
+        let up = |n: i32| (n + COARSE - 1) / COARSE;
+        let coarse_size = [up(size[0]), up(size[1]), up(size[2])];
+        let coarse_total = (coarse_size[0] * coarse_size[1] * coarse_size[2]) as usize;
+        Self { size, origin, cells: vec![0; total], coarse_size, coarse: vec![false; coarse_total] }
+    }
+
+    fn coarse_index(&self, cx: i32, cy: i32, cz: i32) -> usize {
+        ((cy * self.coarse_size[2] + cz) * self.coarse_size[0] + cx) as usize
+    }
+
+    /// Recalcula la rejilla gruesa. Se llama una vez terminada la escena.
+    pub fn rebuild_coarse(&mut self) {
+        self.coarse.iter_mut().for_each(|c| *c = false);
+        for y in 0..self.size[1] {
+            for z in 0..self.size[2] {
+                for x in 0..self.size[0] {
+                    if self.cells[self.index(x, y, z)] != 0 {
+                        let i = self.coarse_index(
+                            x.div_euclid(COARSE),
+                            y.div_euclid(COARSE),
+                            z.div_euclid(COARSE),
+                        );
+                        self.coarse[i] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// ¿El macro-bloque que contiene esta celda tiene algo sólido?
+    fn coarse_occupied(&self, cell: [i32; 3]) -> bool {
+        let (cx, cy, cz) = (
+            cell[0].div_euclid(COARSE),
+            cell[1].div_euclid(COARSE),
+            cell[2].div_euclid(COARSE),
+        );
+        if cx < 0 || cy < 0 || cz < 0 {
+            return true;
+        }
+        if cx >= self.coarse_size[0] || cy >= self.coarse_size[1] || cz >= self.coarse_size[2] {
+            return true;
+        }
+        self.coarse[self.coarse_index(cx, cy, cz)]
     }
 
     fn in_bounds(&self, x: i32, y: i32, z: i32) -> bool {
         x >= 0 && y >= 0 && z >= 0 && x < self.size[0] && y < self.size[1] && z < self.size[2]
+    }
+
+    /// Índice lineal de una celda; lo usa la caché de oclusión ambiental.
+    pub fn cell_index(&self, x: i32, y: i32, z: i32) -> usize {
+        self.index(x, y, z)
+    }
+
+    pub fn cell_count(&self) -> usize {
+        (self.size[0] * self.size[1] * self.size[2]) as usize
     }
 
     fn index(&self, x: i32, y: i32, z: i32) -> usize {
@@ -52,6 +109,14 @@ impl Grid {
         if self.in_bounds(x, y, z) {
             let i = self.index(x, y, z);
             self.cells[i] = id;
+            if id != 0 {
+                let c = self.coarse_index(
+                    x.div_euclid(COARSE),
+                    y.div_euclid(COARSE),
+                    z.div_euclid(COARSE),
+                );
+                self.coarse[c] = true;
+            }
         }
     }
 
@@ -114,6 +179,9 @@ impl Grid {
 
     /// Lanza un rayo por la rejilla. `skip` permite ignorar ciertos materiales
     /// (por ejemplo, el agua cuando el rayo ya viaja dentro de ella).
+    ///
+    /// Avanza celda por celda (DDA), pero cuando entra en un macro-bloque vacío
+    /// salta directo a su salida en vez de recorrer sus 8 celdas.
     pub fn traverse<F>(&self, origin: Vec3, dir: Vec3, max_dist: f32, skip: F) -> Option<VoxelHit>
     where
         F: Fn(u8) -> bool,
@@ -123,49 +191,93 @@ impl Grid {
         if t > max_dist {
             return None;
         }
-
-        let start = origin + dir * (t + EPSILON) - self.origin;
-        let mut cell = [
-            (start.x.floor() as i32).clamp(0, self.size[0] - 1),
-            (start.y.floor() as i32).clamp(0, self.size[1] - 1),
-            (start.z.floor() as i32).clamp(0, self.size[2] - 1),
-        ];
+        let limit = max_dist.min(t_exit);
 
         let mut step = [0i32; 3];
-        let mut t_max = [f32::INFINITY; 3];
         let mut t_delta = [f32::INFINITY; 3];
-
         for i in 0..3 {
             let d = axis(dir, i);
             if d.abs() < 1e-9 {
                 continue;
             }
             step[i] = if d > 0.0 { 1 } else { -1 };
-            let boundary =
-                axis(self.origin, i) + (cell[i] + if d > 0.0 { 1 } else { 0 }) as f32;
-            t_max[i] = (boundary - axis(origin, i)) / d;
             t_delta[i] = 1.0 / d.abs();
         }
 
+        // Estado del DDA en el punto `t`: celda actual y distancia a cada frontera.
+        let cell_at = |t: f32| {
+            let p = origin + dir * (t + EPSILON) - self.origin;
+            [p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32]
+        };
+        let boundaries = |cell: [i32; 3]| {
+            let mut t_max = [f32::INFINITY; 3];
+            for i in 0..3 {
+                if step[i] == 0 {
+                    continue;
+                }
+                let edge = axis(self.origin, i) + (cell[i] + (step[i] > 0) as i32) as f32;
+                t_max[i] = (edge - axis(origin, i)) / axis(dir, i);
+            }
+            t_max
+        };
+
+        let mut cell = cell_at(t);
+        for i in 0..3 {
+            cell[i] = cell[i].clamp(0, self.size[i] - 1);
+        }
+        let mut t_max = boundaries(cell);
         let mut normal = entry_normal;
-        let limit = max_dist.min(t_exit);
+        let mut check_coarse = true;
 
         loop {
             if !self.in_bounds(cell[0], cell[1], cell[2]) {
                 return None;
             }
+
             let id = self.get(cell[0], cell[1], cell[2]);
             if id != 0 && !skip(id) {
-                return Some(VoxelHit {
-                    distance: t,
-                    point: origin + dir * t,
-                    normal,
-                    id,
-                    cell,
-                });
+                return Some(VoxelHit { distance: t, point: origin + dir * t, normal, id, cell });
             }
 
-            // Avanza al siguiente voxel por el eje cuya frontera está más cerca.
+            // Macro-bloque vacío: salta hasta su salida. Sólo hace falta
+            // consultarlo al entrar a un macro-bloque nuevo.
+            if check_coarse && !self.coarse_occupied(cell) {
+                let mut t_jump = f32::INFINITY;
+                let mut jump_axis = 0usize;
+                for i in 0..3 {
+                    if step[i] == 0 {
+                        continue;
+                    }
+                    let block = cell[i].div_euclid(COARSE);
+                    let edge_cell = (block + (step[i] > 0) as i32) * COARSE;
+                    let edge = axis(self.origin, i) + edge_cell as f32;
+                    let t_axis = (edge - axis(origin, i)) / axis(dir, i);
+                    if t_axis < t_jump {
+                        t_jump = t_axis;
+                        jump_axis = i;
+                    }
+                }
+
+                if t_jump > t + EPSILON {
+                    if t_jump > limit {
+                        return None;
+                    }
+                    t = t_jump;
+                    cell = cell_at(t);
+                    t_max = boundaries(cell);
+                    check_coarse = true;
+                    normal = Vec3::default();
+                    let sign = -step[jump_axis] as f32;
+                    match jump_axis {
+                        0 => normal.x = sign,
+                        1 => normal.y = sign,
+                        _ => normal.z = sign,
+                    }
+                    continue;
+                }
+            }
+
+            // Paso normal: avanza al voxel vecino por el eje más cercano.
             let a = if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
                 0
             } else if t_max[1] < t_max[2] {
@@ -179,6 +291,8 @@ impl Grid {
             }
             cell[a] += step[a];
             t_max[a] += t_delta[a];
+            // Sólo se cambió de macro-bloque si se cruzó un múltiplo de COARSE.
+            check_coarse = (cell[a] & (COARSE - 1)) == if step[a] > 0 { 0 } else { COARSE - 1 };
             normal = Vec3::default();
             let sign = -step[a] as f32;
             match a {

@@ -1,6 +1,8 @@
 //! Trazado de rayos: iluminación Phong, sombras, reflexión y refracción.
 
 use std::f32::consts::PI;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 
 use crate::camera::Camera;
@@ -13,15 +15,80 @@ use crate::voxel::Grid;
 
 const MAX_DEPTH: u32 = 3;
 const BIAS: f32 = 1e-3;
-const MAX_DIST: f32 = 400.0;
+/// Alcance máximo de un rayo. El recorrido ya se corta al salir de la rejilla,
+/// así que sólo tiene que ser mayor que la diagonal del mundo más la distancia
+/// de la cámara.
+const MAX_DIST: f32 = 10_000.0;
 const FOV: f32 = PI / 6.0;
 /// Color del agua acumulado por dispersión.
 const WATER_TINT: Vec3 = Vec3::new(0.05, 0.28, 0.30);
 /// Cuánta luz del cielo llega a las zonas en sombra.
 const AMBIENT: f32 = 0.24;
-/// Rayos de oclusión ambiental por impacto y su alcance en voxeles.
-const AO_RAYS: usize = 13;
+/// Alcance de los rayos de oclusión ambiental, en voxeles.
 const AO_DIST: f32 = 5.0;
+/// Rayos de oclusión ambiental de una imagen final.
+pub const AO_RAYS_FULL: usize = 13;
+
+/// Ajustes que se bajan mientras la cámara se mueve y se suben al detenerse.
+#[derive(Clone, Copy)]
+pub struct Quality {
+    /// Rayos de oclusión ambiental por impacto (0 la desactiva).
+    pub ao_rays: usize,
+    /// Rebotes de reflexión y refracción.
+    pub max_depth: u32,
+    /// Sombra cacheada por cara en vez de por pixel. Es mucho más rápida, pero
+    /// el borde de la sombra se escalona bloque a bloque: sólo se usa mientras
+    /// la cámara se mueve, nunca en las imágenes finales.
+    pub fast_shadows: bool,
+}
+
+impl Default for Quality {
+    fn default() -> Self {
+        Self { ao_rays: AO_RAYS_FULL, max_depth: MAX_DEPTH, fast_shadows: false }
+    }
+}
+
+/// Oclusión ambiental ya calculada, una entrada por cara de cubo.
+///
+/// La geometría no cambia, así que la oclusión de una cara es siempre la misma:
+/// se calcula la primera vez que se ve y se reutiliza en todos los pixeles y
+/// todos los cuadros. Se guarda con enteros atómicos para que los hilos puedan
+/// llenarla sin bloquearse (0 = sin calcular).
+pub struct AoCache {
+    values: Vec<AtomicU8>,
+}
+
+impl AoCache {
+    pub fn new(cells: usize) -> Self {
+        Self { values: (0..cells * 6).map(|_| AtomicU8::new(0)).collect() }
+    }
+
+    fn slot(&self, index: usize) -> &AtomicU8 {
+        &self.values[index]
+    }
+}
+
+/// Índice de la cara golpeada dentro de una celda (0..5).
+fn face_index(normal: Vec3) -> usize {
+    if normal.x.abs() > 0.5 {
+        (normal.x > 0.0) as usize
+    } else if normal.y.abs() > 0.5 {
+        2 + (normal.y > 0.0) as usize
+    } else {
+        4 + (normal.z > 0.0) as usize
+    }
+}
+
+/// Farol: luz puntual con alcance limitado.
+pub struct PointLight {
+    pub position: Vec3,
+    pub radius: f32,
+}
+
+/// Color cálido de los faroles.
+const LANTERN_COLOR: Vec3 = Vec3::new(1.0, 0.72, 0.38);
+/// Tope de intensidad que guarda la caché de luz.
+const LIGHT_MAX: f32 = 6.0;
 
 pub struct Scene {
     pub grid: Grid,
@@ -30,6 +97,16 @@ pub struct Scene {
     pub sun_color: Vec3,
     /// Instante de la animación (mueve el oleaje).
     pub time: f32,
+    pub quality: Quality,
+    /// Cuánto rinden los faroles (de noche iluminan mucho más).
+    pub lantern_power: f32,
+    /// Faroles de la escena (posición de cada bloque emisivo).
+    pub lights: Vec<PointLight>,
+    pub ao_cache: AoCache,
+    /// Luz de los faroles ya acumulada por cara.
+    pub light_cache: AoCache,
+    /// Sombras ya calculadas por cara (0 = sin calcular, 1 = al sol, 2 = en sombra).
+    pub shadow_cache: AoCache,
 }
 
 fn transparent(id: u8) -> bool {
@@ -67,7 +144,31 @@ fn fresnel(cos_i: f32, ior: f32) -> f32 {
 
 /// Oclusión ambiental: lanza rayos cortos en el hemisferio de la normal para
 /// oscurecer rincones y grietas entre bloques.
-fn ambient_occlusion(scene: &Scene, point: Vec3, normal: Vec3) -> f32 {
+/// Devuelve la oclusión de la cara golpeada, calculándola sólo si hace falta.
+fn ambient_occlusion(scene: &Scene, cell: [i32; 3], normal: Vec3) -> f32 {
+    let rays = scene.quality.ao_rays;
+    if rays == 0 {
+        return 1.0;
+    }
+
+    let face = face_index(normal);
+    let slot = scene.ao_cache.slot(scene.grid.cell_index(cell[0], cell[1], cell[2]) * 6 + face);
+
+    let cached = slot.load(Ordering::Relaxed);
+    if cached != 0 {
+        return (cached - 1) as f32 / 254.0;
+    }
+
+    // Se mide en el centro de la cara: una cara de cubo ocupa pocos pixeles.
+    let center = scene.grid.origin
+        + Vec3::new(cell[0] as f32 + 0.5, cell[1] as f32 + 0.5, cell[2] as f32 + 0.5)
+        + normal * 0.5;
+    let value = trace_occlusion(scene, center, normal, rays);
+    slot.store(1 + (value * 254.0) as u8, Ordering::Relaxed);
+    value
+}
+
+fn trace_occlusion(scene: &Scene, point: Vec3, normal: Vec3, rays: usize) -> f32 {
     // Base tangente a partir de la normal (las caras están alineadas a los ejes).
     let helper = if normal.y.abs() > 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
     let tangent = normal.cross(helper).normalize();
@@ -76,11 +177,11 @@ fn ambient_occlusion(scene: &Scene, point: Vec3, normal: Vec3) -> f32 {
     let origin = point + normal * (BIAS * 4.0);
     let mut open = 0.0;
 
-    for i in 0..AO_RAYS {
+    for i in 0..rays {
         let (dir, weight) = if i == 0 {
             (normal, 1.0)
         } else {
-            let angle = (i as f32 - 1.0) * std::f32::consts::TAU / (AO_RAYS - 1) as f32;
+            let angle = (i as f32 - 1.0) * std::f32::consts::TAU / (rays - 1) as f32;
             let tilt = if i % 2 == 0 { 0.80 } else { 0.50 };
             let side = tangent * angle.cos() + bitangent * angle.sin();
             ((normal * tilt + side * (1.0 - tilt * tilt).sqrt()).normalize(), tilt)
@@ -93,7 +194,7 @@ fn ambient_occlusion(scene: &Scene, point: Vec3, normal: Vec3) -> f32 {
         }
     }
 
-    let total: f32 = 1.0 + (1..AO_RAYS).map(|i| if i % 2 == 0 { 0.80 } else { 0.50 }).sum::<f32>();
+    let total: f32 = 1.0 + (1..rays).map(|i| if i % 2 == 0 { 0.80 } else { 0.50 }).sum::<f32>();
     (open / total).clamp(0.0, 1.0)
 }
 
@@ -104,6 +205,72 @@ fn shadow_factor(scene: &Scene, point: Vec3, normal: Vec3) -> f32 {
         Some(_) => 0.0,
         None => 1.0,
     }
+}
+
+/// Luz que los faroles aportan a una cara. Como ni las luces ni la geometría se
+/// mueven, se calcula la primera vez que se ve la cara y se reutiliza siempre.
+fn lantern_light(scene: &Scene, cell: [i32; 3], normal: Vec3) -> f32 {
+    if scene.lights.is_empty() {
+        return 0.0;
+    }
+
+    let face = face_index(normal);
+    let slot = scene.light_cache.slot(scene.grid.cell_index(cell[0], cell[1], cell[2]) * 6 + face);
+    let cached = slot.load(Ordering::Relaxed);
+    if cached != 0 {
+        return (cached - 1) as f32 / 254.0 * LIGHT_MAX;
+    }
+
+    let center = scene.grid.origin
+        + Vec3::new(cell[0] as f32 + 0.5, cell[1] as f32 + 0.5, cell[2] as f32 + 0.5)
+        + normal * 0.5;
+
+    let mut total = 0.0;
+    for light in &scene.lights {
+        let to_light = light.position - center;
+        let distance = to_light.length();
+        if distance > light.radius || distance < 1e-3 {
+            continue;
+        }
+        let dir = to_light * (1.0 / distance);
+        let facing = normal.dot(dir);
+        if facing <= 0.0 {
+            continue;
+        }
+        // Atenuación suave: llega a cero justo en el radio.
+        let falloff = (1.0 - distance / light.radius).powi(2);
+        if scene
+            .grid
+            .traverse(center + normal * (BIAS * 4.0), dir, distance - 1.2, transparent)
+            .is_some()
+        {
+            continue;
+        }
+        total += facing * falloff;
+    }
+
+    let stored = (total / LIGHT_MAX).clamp(0.0, 1.0);
+    slot.store(1 + (stored * 254.0) as u8, Ordering::Relaxed);
+    total.min(LIGHT_MAX)
+}
+
+/// Sombra de la cara completa, calculada una sola vez y reutilizada.
+fn shadow_cached(scene: &Scene, cell: [i32; 3], normal: Vec3) -> f32 {
+    let face = face_index(normal);
+    let slot = scene.shadow_cache.slot(scene.grid.cell_index(cell[0], cell[1], cell[2]) * 6 + face);
+
+    match slot.load(Ordering::Relaxed) {
+        1 => return 1.0,
+        2 => return 0.0,
+        _ => {}
+    }
+
+    let center = scene.grid.origin
+        + Vec3::new(cell[0] as f32 + 0.5, cell[1] as f32 + 0.5, cell[2] as f32 + 0.5)
+        + normal * 0.5;
+    let lit = shadow_factor(scene, center, normal);
+    slot.store(if lit > 0.5 { 1 } else { 2 }, Ordering::Relaxed);
+    lit
 }
 
 pub fn cast_ray(scene: &Scene, origin: Vec3, dir: Vec3, depth: u32, ignore: u8) -> Vec3 {
@@ -132,21 +299,30 @@ fn trace(scene: &Scene, origin: Vec3, dir: Vec3, depth: u32, ignore: u8) -> (Vec
     // --- Iluminación local (Phong) ---
     let view = -dir;
     let light = scene.sun_dir;
-    let shade = shadow_factor(scene, hit.point, hit.normal);
+    let shade = if scene.quality.fast_shadows {
+        shadow_cached(scene, hit.cell, hit.normal)
+    } else {
+        shadow_factor(scene, hit.point, hit.normal)
+    };
 
     let diffuse = normal.dot(light).max(0.0) * shade;
     let reflect_dir = (-light).reflect(normal);
     let specular = view.dot(reflect_dir).max(0.0).powf(material.specular) * shade;
 
     // Luz ambiental tomada del propio skybox (cielo en la dirección de la normal).
-    let occlusion = if depth == 0 { ambient_occlusion(scene, hit.point, hit.normal) } else { 1.0 };
+    let occlusion = ambient_occlusion(scene, hit.cell, hit.normal);
     let ambient = scene.sky.sample(normal) * (AMBIENT * (0.04 + 0.96 * occlusion.powf(1.4)));
 
-    let mut color = tex * (ambient + scene.sun_color * (material.albedo[0] * diffuse))
+    let lantern = lantern_light(scene, hit.cell, hit.normal);
+
+    let mut color = tex
+        * (ambient
+            + scene.sun_color * (material.albedo[0] * diffuse)
+            + LANTERN_COLOR * (material.albedo[0] * lantern * scene.lantern_power))
         + scene.sun_color * (material.albedo[1] * specular)
         + material.emissive * tex;
 
-    if depth >= MAX_DEPTH || (material.reflectivity <= 0.0 && material.transparency <= 0.0) {
+    if depth >= scene.quality.max_depth || (material.reflectivity <= 0.0 && material.transparency <= 0.0) {
         return (color, distance);
     }
 
@@ -224,27 +400,34 @@ pub fn render(
     let inv_samples = 1.0 / (samples * samples) as f32;
 
     let workers = thread::available_parallelism().map_or(4, |n| n.get());
-    let rows = height.div_ceil(workers).max(1);
+
+    // Cola de filas: cada hilo toma la siguiente que quede libre. Repartir
+    // bloques fijos desperdicia núcleos, porque las filas de cielo son mucho
+    // más baratas que las del bosque.
+    let queue = Mutex::new(pixels.chunks_mut(width).enumerate().collect::<Vec<_>>());
 
     thread::scope(|s| {
-        for (chunk_index, chunk) in pixels.chunks_mut(width * rows).enumerate() {
-            s.spawn(move || {
-                for (i, pixel) in chunk.iter_mut().enumerate() {
-                    let x = i % width;
-                    let y = chunk_index * rows + i / width;
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let Some((y, row)) = queue.lock().expect("cola de filas").pop() else {
+                        break;
+                    };
 
-                    let mut color = Vec3::default();
-                    for sy in 0..samples {
-                        for sx in 0..samples {
-                            let ox = (sx as f32 + 0.5) / samples as f32;
-                            let oy = (sy as f32 + 0.5) / samples as f32;
-                            let px = ((2.0 * (x as f32 + ox)) / width as f32 - 1.0) * aspect * scale;
-                            let py = (1.0 - (2.0 * (y as f32 + oy)) / height as f32) * scale;
-                            let dir = camera.basis_change(Vec3::new(px, py, -1.0));
-                            color += cast_ray(scene, eye, dir, 0, 0);
+                    for (x, pixel) in row.iter_mut().enumerate() {
+                        let mut color = Vec3::default();
+                        for sy in 0..samples {
+                            for sx in 0..samples {
+                                let ox = (sx as f32 + 0.5) / samples as f32;
+                                let oy = (sy as f32 + 0.5) / samples as f32;
+                                let px = ((2.0 * (x as f32 + ox)) / width as f32 - 1.0) * aspect * scale;
+                                let py = (1.0 - (2.0 * (y as f32 + oy)) / height as f32) * scale;
+                                let dir = camera.basis_change(Vec3::new(px, py, -1.0));
+                                color += cast_ray(scene, eye, dir, 0, 0);
+                            }
                         }
+                        *pixel = tonemap(color * inv_samples);
                     }
-                    *pixel = tonemap(color * inv_samples);
                 }
             });
         }

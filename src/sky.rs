@@ -1,7 +1,7 @@
 //! Skybox procedural: seis texturas de cubo generadas una sola vez y
 //! muestreadas por dirección con interpolación bilineal.
 
-use crate::noise::fbm_3d;
+use crate::noise::{fbm_3d, hash_3i};
 use crate::vec3::Vec3;
 
 /// Ejes de cada cara: (eje principal, signo, eje u, eje v).
@@ -41,7 +41,7 @@ pub struct Skybox {
 impl Skybox {
     /// Genera las seis caras a partir de la dirección 3D, así la textura queda
     /// continua en los bordes del cubo.
-    pub fn generate(size: usize, sun_dir: Vec3) -> Self {
+    pub fn generate(size: usize, sun_dir: Vec3, night: bool) -> Self {
         let mut faces = Vec::with_capacity(6);
         for face in 0..6 {
             let mut pixels = vec![Vec3::default(); size * size];
@@ -49,7 +49,7 @@ impl Skybox {
                 for x in 0..size {
                     let u = (x as f32 + 0.5) / size as f32;
                     let v = (y as f32 + 0.5) / size as f32;
-                    pixels[y * size + x] = sky_color(face_direction(face, u, v), sun_dir);
+                    pixels[y * size + x] = sky_color(face_direction(face, u, v), sun_dir, night);
                 }
             }
             faces.push(pixels);
@@ -99,7 +99,10 @@ impl Skybox {
 }
 
 /// Color del cielo en una dirección: degradado, nubes, sol y fondo neutro.
-fn sky_color(dir: Vec3, sun_dir: Vec3) -> Vec3 {
+fn sky_color(dir: Vec3, sun_dir: Vec3, night: bool) -> Vec3 {
+    if night {
+        return night_sky(dir.normalize(), sun_dir);
+    }
     let d = dir.normalize();
 
     let up = d.y.max(0.0);
@@ -126,6 +129,41 @@ fn sky_color(dir: Vec3, sun_dir: Vec3) -> Vec3 {
     if d.y < 0.0 {
         let t = (-d.y * 3.0).clamp(0.0, 1.0);
         let ground = Vec3::new(0.58, 0.57, 0.62);
+        color = color + (ground - color) * t;
+    }
+
+    color
+}
+
+/// Cielo nocturno: degradado azul oscuro, estrellas, luna y su halo.
+fn night_sky(d: Vec3, moon_dir: Vec3) -> Vec3 {
+    let up = d.y.max(0.0);
+    let horizon = Vec3::new(0.055, 0.075, 0.125);
+    let zenith = Vec3::new(0.012, 0.020, 0.052);
+    let mut color = horizon + (zenith - horizon) * up.powf(0.5);
+
+    // Estrellas: se sortea una por celda de dirección.
+    if d.y > -0.02 {
+        let cell = d * 260.0;
+        let (i, j, k) = (cell.x.floor() as i32, cell.y.floor() as i32, cell.z.floor() as i32);
+        let roll = hash_3i(i, j, k, 909);
+        if roll > 0.9955 {
+            let brightness = (roll - 0.9955) / 0.0045;
+            let twinkle = 0.45 + 0.55 * hash_3i(i, j, k, 911);
+            color += Vec3::new(0.85, 0.88, 1.0) * brightness * twinkle * 1.4;
+        }
+    }
+
+    // Luna y su halo.
+    let m = d.dot(moon_dir).max(0.0);
+    color += Vec3::new(0.95, 0.95, 0.85) * m.powf(5000.0) * 14.0;
+    color += Vec3::new(0.55, 0.62, 0.85) * m.powf(90.0) * 0.30;
+    color += Vec3::new(0.30, 0.38, 0.60) * m.powf(6.0) * 0.045;
+
+    // Bajo el horizonte, un fondo oscuro parejo.
+    if d.y < 0.0 {
+        let t = (-d.y * 3.0).clamp(0.0, 1.0);
+        let ground = Vec3::new(0.035, 0.038, 0.052);
         color = color + (ground - color) * t;
     }
 

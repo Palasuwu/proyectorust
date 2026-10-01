@@ -109,6 +109,12 @@ pub fn sample(id: u8, point: Vec3, normal: Vec3, cell: [i32; 3]) -> Vec3 {
             let petal = hash_2i(tu, tv, 37);
             if petal > 0.55 { base * (0.9 + petal * 0.2) } else { Vec3::new(0.35, 0.55, 0.28) }
         }
+        Kind::Beam => {
+            // Madera oscura con vetas marcadas a lo largo.
+            let vein = value_noise_2d(tu as f32 * 0.9, tv as f32 * 0.18, 41);
+            let knot = if grain < 0.05 { -0.25 } else { 0.0 };
+            base * (0.80 + vein * 0.45 + knot)
+        }
         Kind::Air => base,
     }
 }
