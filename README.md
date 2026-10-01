@@ -6,11 +6,13 @@ Diorama de una laguna con una cabaña de madera, renderizado con un **raytracer 
 
 ## Video
 
-Vuelta completa de la cámara con acercamiento y alejamiento, y el oleaje en movimiento:
+Una vuelta completa de cámara con acercamiento y alejamiento, mientras la escena pasa de día a noche:
 
-![Animación](docs/diorama.gif)
+![Animación del diorama](docs/diorama.gif)
 
-El video en calidad completa (960×720, 24 fps) está en [`docs/diorama.mp4`](docs/diorama.mp4).
+El video en calidad completa (960×720, 30 fps, 180 cuadros) está en [`docs/diorama.mp4`](docs/diorama.mp4).
+
+> Para que el `.mp4` se reproduzca aquí mismo con controles, hay que arrastrarlo a la caja de edición del README en github.com: GitHub lo sube a su CDN y genera un enlace reproducible. Un `.mp4` que vive en el repo solo aparece como enlace de descarga; el GIF de arriba sí se reproduce solo.
 
 ## Modo noche
 
@@ -53,7 +55,16 @@ Abre la escena dentro de la terminal y la cámara se mueve con el teclado, redib
 | `r` | Volver a la vista inicial |
 | `q` | Salir |
 
-No usa ninguna ventana ni librería gráfica: [`src/live.rs`](src/live.rs) pinta cada celda de la terminal con el carácter de medio bloque `▀` y color RGB de 24 bits, así cada celda muestra dos pixeles. El modo crudo del teclado se pide al programa `stty` del sistema.
+No usa ninguna librería gráfica: [`src/live.rs`](src/live.rs) pinta cada celda de la terminal con el carácter de medio bloque `▀` y color RGB de 24 bits, así cada celda muestra dos pixeles. El modo crudo del teclado se pide al programa `stty` del sistema.
+
+### Sobre las dependencias
+
+El raytracer es 100% propio y el proyecto **no enlaza ninguna librería externa**: `Cargo.toml` no tiene dependencias y todo sale de la librería estándar de Rust. El render a imagen (`cargo run --release`) no necesita absolutamente nada más.
+
+Los modos interactivos sí se apoyan en dos **programas del sistema**, que no son librerías del proyecto:
+
+- `stty` (incluido en macOS y Linux) para poner el teclado en modo crudo, en `--live` y `--window`
+- `ffplay` sólo en `--window`, y únicamente como pantalla: recibe los pixeles ya calculados por una tubería y los muestra
 
 ## Cómo ejecutarlo
 
@@ -159,6 +170,8 @@ Una imagen de 900×700 con calidad completa pasó de **375 ms a 111 ms** (3.4× 
 | Rejilla gruesa de 8×8×8 ([`src/voxel.rs`](src/voxel.rs)) | Los rayos saltan de golpe los macro-bloques vacíos en vez de recorrer el aire celda por celda | 375 → 260 ms |
 | Reparto dinámico de filas ([`src/render.rs`](src/render.rs)) | Cada hilo toma la siguiente fila libre: las filas de cielo son mucho más baratas que las del bosque y con bloques fijos sobraban núcleos ociosos | 260 → 195 ms |
 | Caché de oclusión ambiental por cara de cubo | La geometría no cambia, así que la oclusión de una cara siempre da lo mismo: se calcula una vez y se reutiliza en todos los pixeles y cuadros (enteros atómicos, sin bloqueos) | 195 → 111 ms |
+
+La misma idea se reutiliza para las sombras del sol (mientras la cámara se mueve) y para los faroles del modo noche, por eso una imagen nocturna con nueve luces cuesta casi lo mismo que una diurna.
 
 El reparto de costos se midió apagando cada parte por separado: la oclusión ambiental se llevaba la mitad del tiempo, las sombras 22 ms y las texturas 7 ms.
 

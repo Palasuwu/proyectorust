@@ -121,9 +121,9 @@ fn main() {
 
     // De noche el "sol" pasa a ser la luna: tenue y azulada, y los faroles mandan.
     let (sun_color, lantern_power) = if opts.night {
-        (Vec3::new(0.16, 0.19, 0.32), 4.2)
+        (NIGHT_SUN, 4.2)
     } else {
-        (Vec3::new(1.28, 1.20, 1.02), 1.0)
+        (DAY_SUN, 1.0)
     };
     let grid = scene::build();
     let ao_cache = render::AoCache::new(grid.cell_count());
@@ -136,6 +136,10 @@ fn main() {
     let mut scene = Scene {
         grid,
         sky: Skybox::generate(256, sun_dir, opts.night),
+        // La animación necesita los dos cielos para pasar de día a noche.
+        sky_night: (opts.frames > 0 && !opts.night)
+            .then(|| Skybox::generate(256, sun_dir, true)),
+        night_blend: 0.0,
         sun_dir,
         sun_color,
         time: opts.time,
@@ -196,6 +200,13 @@ fn main() {
 
         // El oleaje avanza y la cámara se acerca y se aleja mientras gira.
         scene.time = opts.time + t * 16.0;
+
+        // Atardecer a media vuelta: el cielo, el sol y los faroles se mezclan.
+        let fade = ((t - 0.35) / 0.30).clamp(0.0, 1.0);
+        let night = fade * fade * (3.0 - 2.0 * fade);
+        scene.night_blend = night;
+        scene.sun_color = DAY_SUN + (NIGHT_SUN - DAY_SUN) * night;
+        scene.lantern_power = 1.0 + (4.2 - 1.0) * night;
         camera.yaw = opts.yaw.to_radians() + angle;
         camera.pitch = base_pitch + (angle.sin() * 7.0).to_radians();
         camera.distance = base_distance - 45.0 * (angle * 2.0).sin();
@@ -209,6 +220,9 @@ fn main() {
 }
 
 /// Busca los bloques de farol y los convierte en luces puntuales.
+const DAY_SUN: Vec3 = Vec3::new(1.28, 1.20, 1.02);
+const NIGHT_SUN: Vec3 = Vec3::new(0.16, 0.19, 0.32);
+
 fn collect_lights(grid: &voxel::Grid) -> Vec<render::PointLight> {
     let lantern = material::Kind::Lantern.id();
     let mut lights = Vec::new();

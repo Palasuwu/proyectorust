@@ -93,6 +93,10 @@ const LIGHT_MAX: f32 = 6.0;
 pub struct Scene {
     pub grid: Grid,
     pub sky: Skybox,
+    /// Skybox nocturno, para la transición día->noche de la animación.
+    pub sky_night: Option<Skybox>,
+    /// 0 = día, 1 = noche.
+    pub night_blend: f32,
     pub sun_dir: Vec3,
     pub sun_color: Vec3,
     /// Instante de la animación (mueve el oleaje).
@@ -107,6 +111,20 @@ pub struct Scene {
     pub light_cache: AoCache,
     /// Sombras ya calculadas por cara (0 = sin calcular, 1 = al sol, 2 = en sombra).
     pub shadow_cache: AoCache,
+}
+
+impl Scene {
+    /// Color del cielo, mezclando el skybox de día y el de noche.
+    pub fn sky_at(&self, dir: Vec3) -> Vec3 {
+        let day = self.sky.sample(dir);
+        match &self.sky_night {
+            Some(night) if self.night_blend > 0.0 => {
+                let n = night.sample(dir);
+                day + (n - day) * self.night_blend
+            }
+            _ => day,
+        }
+    }
 }
 
 fn transparent(id: u8) -> bool {
@@ -281,7 +299,7 @@ pub fn cast_ray(scene: &Scene, origin: Vec3, dir: Vec3, depth: u32, ignore: u8) 
 /// impacto: la necesita el agua para absorber la luz según la profundidad.
 fn trace(scene: &Scene, origin: Vec3, dir: Vec3, depth: u32, ignore: u8) -> (Vec3, f32) {
     let Some(hit) = scene.grid.traverse(origin, dir, MAX_DIST, |id| id == ignore) else {
-        return (scene.sky.sample(dir), MAX_DIST);
+        return (scene.sky_at(dir), MAX_DIST);
     };
     let distance = hit.distance;
 
@@ -311,7 +329,7 @@ fn trace(scene: &Scene, origin: Vec3, dir: Vec3, depth: u32, ignore: u8) -> (Vec
 
     // Luz ambiental tomada del propio skybox (cielo en la dirección de la normal).
     let occlusion = ambient_occlusion(scene, hit.cell, hit.normal);
-    let ambient = scene.sky.sample(normal) * (AMBIENT * (0.04 + 0.96 * occlusion.powf(1.4)));
+    let ambient = scene.sky_at(normal) * (AMBIENT * (0.04 + 0.96 * occlusion.powf(1.4)));
 
     let lantern = lantern_light(scene, hit.cell, hit.normal);
 
